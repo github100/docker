@@ -9,19 +9,31 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/system"
+	"github.com/sirupsen/logrus"
 )
 
-func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
+// UnpackLayer unpack `layer` to a `dest`. The stream `layer` can be
+// compressed or uncompressed.
+// Returns the size in bytes of the contents of the layer.
+func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64, err error) {
 	tr := tar.NewReader(layer)
 	trBuf := pools.BufioReader32KPool.Get(tr)
 	defer pools.BufioReader32KPool.Put(trBuf)
 
 	var dirs []*tar.Header
+	unpackedPaths := make(map[string]struct{})
+
+	if options == nil {
+		options = &TarOptions{}
+	}
+	if options.ExcludePatterns == nil {
+		options.ExcludePatterns = []string{}
+	}
+	idMappings := idtools.NewIDMappingsFromMaps(options.UIDMaps, options.GIDMaps)
 
 	aufsTempdir := ""
 	aufsHardlinks := make(map[string]*tar.Header)
@@ -55,7 +67,7 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 		// TODO Windows. Once the registry is aware of what images are Windows-
 		// specific or Linux-specific, this warning should be changed to an error
 		// to cater for the situation where someone does manage to upload a Linux
-		// image but have it tagged as Windows inadvertantly.
+		// image but have it tagged as Windows inadvertently.
 		if runtime.GOOS == "windows" {
 			if strings.Contains(hdr.Name, ":") {
 				logrus.Warnf("Windows: Ignoring %s (is this a Linux image?)", hdr.Name)
@@ -72,7 +84,7 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 			parentPath := filepath.Join(dest, parent)
 
 			if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
-				err = system.MkdirAll(parentPath, 0600)
+				err = system.MkdirAll(parentPath, 0600, "")
 				if err != nil {
 					return 0, err
 				}
@@ -80,11 +92,11 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 		}
 
 		// Skip AUFS metadata dirs
-		if strings.HasPrefix(hdr.Name, ".wh..wh.") {
+		if strings.HasPrefix(hdr.Name, WhiteoutMetaPrefix) {
 			// Regular files inside /.wh..wh.plnk can be used as hardlink targets
 			// We don't want this directory, but we need the files in them so that
 			// such hardlinks can be resolved.
-			if strings.HasPrefix(hdr.Name, ".wh..wh.plnk") && hdr.Typeflag == tar.TypeReg {
+			if strings.HasPrefix(hdr.Name, WhiteoutLinkDir) && hdr.Typeflag == tar.TypeReg {
 				basename := filepath.Base(hdr.Name)
 				aufsHardlinks[basename] = hdr
 				if aufsTempdir == "" {
@@ -93,11 +105,14 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 					}
 					defer os.RemoveAll(aufsTempdir)
 				}
-				if err := createTarFile(filepath.Join(aufsTempdir, basename), dest, hdr, tr, true); err != nil {
+				if err := createTarFile(filepath.Join(aufsTempdir, basename), dest, hdr, tr, true, nil, options.InUserNS); err != nil {
 					return 0, err
 				}
 			}
-			continue
+
+			if hdr.Name != WhiteoutOpaqueDir {
+				continue
+			}
 		}
 		path := filepath.Join(dest, hdr.Name)
 		rel, err := filepath.Rel(dest, path)
@@ -111,11 +126,38 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 		}
 		base := filepath.Base(path)
 
-		if strings.HasPrefix(base, ".wh.") {
-			originalBase := base[len(".wh."):]
-			originalPath := filepath.Join(filepath.Dir(path), originalBase)
-			if err := os.RemoveAll(originalPath); err != nil {
-				return 0, err
+		if strings.HasPrefix(base, WhiteoutPrefix) {
+			dir := filepath.Dir(path)
+			if base == WhiteoutOpaqueDir {
+				_, err := os.Lstat(dir)
+				if err != nil {
+					return 0, err
+				}
+				err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						if os.IsNotExist(err) {
+							err = nil // parent was deleted
+						}
+						return err
+					}
+					if path == dir {
+						return nil
+					}
+					if _, exists := unpackedPaths[path]; !exists {
+						err := os.RemoveAll(path)
+						return err
+					}
+					return nil
+				})
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				originalBase := base[len(WhiteoutPrefix):]
+				originalPath := filepath.Join(dir, originalBase)
+				if err := os.RemoveAll(originalPath); err != nil {
+					return 0, err
+				}
 			}
 		} else {
 			// If path exits we almost always just want to remove and replace it.
@@ -136,7 +178,7 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 
 			// Hard links into /.wh..wh.plnk don't work, as we don't extract that directory, so
 			// we manually retarget these into the temporary files we extracted them into
-			if hdr.Typeflag == tar.TypeLink && strings.HasPrefix(filepath.Clean(hdr.Linkname), ".wh..wh.plnk") {
+			if hdr.Typeflag == tar.TypeLink && strings.HasPrefix(filepath.Clean(hdr.Linkname), WhiteoutLinkDir) {
 				linkBasename := filepath.Base(hdr.Linkname)
 				srcHdr = aufsHardlinks[linkBasename]
 				if srcHdr == nil {
@@ -150,7 +192,11 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 				srcData = tmpFile
 			}
 
-			if err := createTarFile(path, dest, srcHdr, srcData, true); err != nil {
+			if err := remapIDs(idMappings, srcHdr); err != nil {
+				return 0, err
+			}
+
+			if err := createTarFile(path, dest, srcHdr, srcData, true, nil, options.InUserNS); err != nil {
 				return 0, err
 			}
 
@@ -159,13 +205,13 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 			if hdr.Typeflag == tar.TypeDir {
 				dirs = append(dirs, hdr)
 			}
+			unpackedPaths[path] = struct{}{}
 		}
 	}
 
 	for _, hdr := range dirs {
 		path := filepath.Join(dest, hdr.Name)
-		ts := []syscall.Timespec{timeToTimespec(hdr.AccessTime), timeToTimespec(hdr.ModTime)}
-		if err := syscall.UtimesNano(path, ts); err != nil {
+		if err := system.Chtimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
 			return 0, err
 		}
 	}
@@ -173,10 +219,24 @@ func UnpackLayer(dest string, layer ArchiveReader) (size int64, err error) {
 	return size, nil
 }
 
-// ApplyLayer parses a diff in the standard layer format from `layer`, and
-// applies it to the directory `dest`. Returns the size in bytes of the
-// contents of the layer.
-func ApplyLayer(dest string, layer ArchiveReader) (int64, error) {
+// ApplyLayer parses a diff in the standard layer format from `layer`,
+// and applies it to the directory `dest`. The stream `layer` can be
+// compressed or uncompressed.
+// Returns the size in bytes of the contents of the layer.
+func ApplyLayer(dest string, layer io.Reader) (int64, error) {
+	return applyLayerHandler(dest, layer, &TarOptions{}, true)
+}
+
+// ApplyUncompressedLayer parses a diff in the standard layer format from
+// `layer`, and applies it to the directory `dest`. The stream `layer`
+// can only be uncompressed.
+// Returns the size in bytes of the contents of the layer.
+func ApplyUncompressedLayer(dest string, layer io.Reader, options *TarOptions) (int64, error) {
+	return applyLayerHandler(dest, layer, options, false)
+}
+
+// do the bulk load of ApplyLayer, but allow for not calling DecompressStream
+func applyLayerHandler(dest string, layer io.Reader, options *TarOptions, decompress bool) (int64, error) {
 	dest = filepath.Clean(dest)
 
 	// We need to be able to set any perms
@@ -186,9 +246,11 @@ func ApplyLayer(dest string, layer ArchiveReader) (int64, error) {
 	}
 	defer system.Umask(oldmask) // ignore err, ErrNotSupportedPlatform
 
-	layer, err = DecompressStream(layer)
-	if err != nil {
-		return 0, err
+	if decompress {
+		layer, err = DecompressStream(layer)
+		if err != nil {
+			return 0, err
+		}
 	}
-	return UnpackLayer(dest, layer)
+	return UnpackLayer(dest, layer, options)
 }

@@ -1,47 +1,52 @@
+// +build windows
+
 package kernel
 
 import (
 	"fmt"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-type KernelVersionInfo struct {
-	kvi   string
-	major int
-	minor int
-	build int
+// VersionInfo holds information about the kernel.
+type VersionInfo struct {
+	kvi   string // Version of the kernel (e.g. 6.1.7601.17592 -> 6)
+	major int    // Major part of the kernel version (e.g. 6.1.7601.17592 -> 1)
+	minor int    // Minor part of the kernel version (e.g. 6.1.7601.17592 -> 7601)
+	build int    // Build number of the kernel version (e.g. 6.1.7601.17592 -> 17592)
 }
 
-func (k *KernelVersionInfo) String() string {
+func (k *VersionInfo) String() string {
 	return fmt.Sprintf("%d.%d %d (%s)", k.major, k.minor, k.build, k.kvi)
 }
 
-func GetKernelVersion() (*KernelVersionInfo, error) {
+// GetKernelVersion gets the current kernel version.
+func GetKernelVersion() (*VersionInfo, error) {
 
 	var (
-		h         syscall.Handle
+		h         windows.Handle
 		dwVersion uint32
 		err       error
 	)
 
-	KVI := &KernelVersionInfo{"Unknown", 0, 0, 0}
+	KVI := &VersionInfo{"Unknown", 0, 0, 0}
 
-	if err = syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE,
-		syscall.StringToUTF16Ptr(`SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\`),
+	if err = windows.RegOpenKeyEx(windows.HKEY_LOCAL_MACHINE,
+		windows.StringToUTF16Ptr(`SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\`),
 		0,
-		syscall.KEY_READ,
+		windows.KEY_READ,
 		&h); err != nil {
 		return KVI, err
 	}
-	defer syscall.RegCloseKey(h)
+	defer windows.RegCloseKey(h)
 
 	var buf [1 << 10]uint16
 	var typ uint32
 	n := uint32(len(buf) * 2) // api expects array of bytes, not uint16
 
-	if err = syscall.RegQueryValueEx(h,
-		syscall.StringToUTF16Ptr("BuildLabEx"),
+	if err = windows.RegQueryValueEx(h,
+		windows.StringToUTF16Ptr("BuildLabEx"),
 		nil,
 		&typ,
 		(*byte)(unsafe.Pointer(&buf[0])),
@@ -49,11 +54,11 @@ func GetKernelVersion() (*KernelVersionInfo, error) {
 		return KVI, err
 	}
 
-	KVI.kvi = syscall.UTF16ToString(buf[:])
+	KVI.kvi = windows.UTF16ToString(buf[:])
 
 	// Important - docker.exe MUST be manifested for this API to return
 	// the correct information.
-	if dwVersion, err = syscall.GetVersion(); err != nil {
+	if dwVersion, err = windows.GetVersion(); err != nil {
 		return KVI, err
 	}
 

@@ -1,5 +1,3 @@
-// +build windows
-
 package system
 
 import (
@@ -7,30 +5,45 @@ import (
 	"time"
 )
 
-type Stat_t struct {
-	name    string
-	size    int64
-	mode    os.FileMode
-	modTime time.Time
-	isDir   bool
+// StatT type contains status of a file. It contains metadata
+// like permission, size, etc about a file.
+type StatT struct {
+	mode os.FileMode
+	size int64
+	mtim time.Time
 }
 
-func (s Stat_t) Name() string {
-	return s.name
-}
-
-func (s Stat_t) Size() int64 {
+// Size returns file's size.
+func (s StatT) Size() int64 {
 	return s.size
 }
 
-func (s Stat_t) Mode() os.FileMode {
-	return s.mode
+// Mode returns file's permission mode.
+func (s StatT) Mode() os.FileMode {
+	return os.FileMode(s.mode)
 }
 
-func (s Stat_t) ModTime() time.Time {
-	return s.modTime
+// Mtim returns file's last modification time.
+func (s StatT) Mtim() time.Time {
+	return time.Time(s.mtim)
 }
 
-func (s Stat_t) IsDir() bool {
-	return s.isDir
+// Stat takes a path to a file and returns
+// a system.StatT type pertaining to that file.
+//
+// Throws an error if the file does not exist
+func Stat(path string) (*StatT, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return fromStatT(&fi)
+}
+
+// fromStatT converts a os.FileInfo type to a system.StatT type
+func fromStatT(fi *os.FileInfo) (*StatT, error) {
+	return &StatT{
+		size: (*fi).Size(),
+		mode: (*fi).Mode(),
+		mtim: (*fi).ModTime()}, nil
 }

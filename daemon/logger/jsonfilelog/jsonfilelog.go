@@ -1,87 +1,168 @@
+// Package jsonfilelog provides the default Logger implementation for
+// Docker logging. This logger logs to files on the host server in the
+// JSON format.
 package jsonfilelog
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
-	"os"
+	"strconv"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/jsonlog"
-	"github.com/docker/docker/pkg/timeutils"
+	"github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
+	"github.com/docker/docker/daemon/logger/loggerutils"
+	units "github.com/docker/go-units"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-const (
-	Name = "json-file"
-)
+// Name is the name of the file that the jsonlogger logs to.
+const Name = "json-file"
 
-// JSONFileLogger is Logger implementation for default docker logging:
-// JSON objects to file
+// JSONFileLogger is Logger implementation for default Docker logging.
 type JSONFileLogger struct {
-	buf *bytes.Buffer
-	f   *os.File   // store for closing
-	mu  sync.Mutex // protects buffer
+	extra []byte // json-encoded extra attributes
 
-	ctx logger.Context
+	mu      sync.RWMutex
+	buf     *bytes.Buffer // avoids allocating a new buffer on each call to `Log()`
+	closed  bool
+	writer  *loggerutils.RotateFileWriter
+	readers map[*logger.LogWatcher]struct{} // stores the active log followers
 }
 
 func init() {
 	if err := logger.RegisterLogDriver(Name, New); err != nil {
 		logrus.Fatal(err)
 	}
+	if err := logger.RegisterLogOptValidator(Name, ValidateLogOpt); err != nil {
+		logrus.Fatal(err)
+	}
 }
 
-// New creates new JSONFileLogger which writes to filename
-func New(ctx logger.Context) (logger.Logger, error) {
-	log, err := os.OpenFile(ctx.LogPath, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0600)
+// New creates new JSONFileLogger which writes to filename passed in
+// on given context.
+func New(info logger.Info) (logger.Logger, error) {
+	var capval int64 = -1
+	if capacity, ok := info.Config["max-size"]; ok {
+		var err error
+		capval, err = units.FromHumanSize(capacity)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var maxFiles = 1
+	if maxFileString, ok := info.Config["max-file"]; ok {
+		var err error
+		maxFiles, err = strconv.Atoi(maxFileString)
+		if err != nil {
+			return nil, err
+		}
+		if maxFiles < 1 {
+			return nil, fmt.Errorf("max-file cannot be less than 1")
+		}
+	}
+
+	writer, err := loggerutils.NewRotateFileWriter(info.LogPath, capval, maxFiles)
 	if err != nil {
 		return nil, err
 	}
+
+	var extra []byte
+	attrs, err := info.ExtraAttributes(nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(attrs) > 0 {
+		var err error
+		extra, err = json.Marshal(attrs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &JSONFileLogger{
-		f:   log,
-		buf: bytes.NewBuffer(nil),
-		ctx: ctx,
+		buf:     bytes.NewBuffer(nil),
+		writer:  writer,
+		readers: make(map[*logger.LogWatcher]struct{}),
+		extra:   extra,
 	}, nil
 }
 
-// Log converts logger.Message to jsonlog.JSONLog and serializes it to file
+// Log converts logger.Message to jsonlog.JSONLog and serializes it to file.
 func (l *JSONFileLogger) Log(msg *logger.Message) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	err := writeMessageBuf(l.writer, msg, l.extra, l.buf)
+	l.buf.Reset()
+	l.mu.Unlock()
+	return err
+}
 
-	timestamp, err := timeutils.FastMarshalJSON(msg.Timestamp)
-	if err != nil {
+func writeMessageBuf(w io.Writer, m *logger.Message, extra json.RawMessage, buf *bytes.Buffer) error {
+	if err := marshalMessage(m, extra, buf); err != nil {
+		logger.PutMessage(m)
 		return err
 	}
-	err = (&jsonlog.JSONLogBytes{Log: append(msg.Line, '\n'), Stream: msg.Source, Created: timestamp}).MarshalJSONBuf(l.buf)
-	if err != nil {
-		return err
+	logger.PutMessage(m)
+	_, err := w.Write(buf.Bytes())
+	return errors.Wrap(err, "error writing log entry")
+}
+
+func marshalMessage(msg *logger.Message, extra json.RawMessage, buf *bytes.Buffer) error {
+	logLine := msg.Line
+	if !msg.Partial {
+		logLine = append(msg.Line, '\n')
 	}
-	l.buf.WriteByte('\n')
-	_, err = l.buf.WriteTo(l.f)
+	err := (&jsonlog.JSONLogs{
+		Log:      logLine,
+		Stream:   msg.Source,
+		Created:  msg.Timestamp,
+		RawAttrs: extra,
+	}).MarshalJSONBuf(buf)
 	if err != nil {
-		// this buffer is screwed, replace it with another to avoid races
-		l.buf = bytes.NewBuffer(nil)
-		return err
+		return errors.Wrap(err, "error writing log message to buffer")
+	}
+	err = buf.WriteByte('\n')
+	return errors.Wrap(err, "error finalizing log buffer")
+}
+
+// ValidateLogOpt looks for json specific log options max-file & max-size.
+func ValidateLogOpt(cfg map[string]string) error {
+	for key := range cfg {
+		switch key {
+		case "max-file":
+		case "max-size":
+		case "labels":
+		case "env":
+		case "env-regex":
+		default:
+			return fmt.Errorf("unknown log opt '%s' for json-file log driver", key)
+		}
 	}
 	return nil
 }
 
-func (l *JSONFileLogger) GetReader() (io.Reader, error) {
-	return os.Open(l.ctx.LogPath)
-}
-
+// LogPath returns the location the given json logger logs to.
 func (l *JSONFileLogger) LogPath() string {
-	return l.ctx.LogPath
+	return l.writer.LogPath()
 }
 
-// Close closes underlying file
+// Close closes underlying file and signals all readers to stop.
 func (l *JSONFileLogger) Close() error {
-	return l.f.Close()
+	l.mu.Lock()
+	l.closed = true
+	err := l.writer.Close()
+	for r := range l.readers {
+		r.Close()
+		delete(l.readers, r)
+	}
+	l.mu.Unlock()
+	return err
 }
 
-// Name returns name of this logger
+// Name returns name of this logger.
 func (l *JSONFileLogger) Name() string {
 	return Name
 }

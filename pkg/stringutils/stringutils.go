@@ -1,27 +1,14 @@
+// Package stringutils provides helper functions for dealing with strings.
 package stringutils
 
 import (
 	"bytes"
 	"math/rand"
 	"strings"
-
-	"github.com/docker/docker/pkg/random"
 )
 
-// Generate alpha only random stirng with length n
-func GenerateRandomAlphaOnlyString(n int) string {
-	// make a really long string
-	letters := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	b := make([]byte, n)
-	r := rand.New(random.NewSource())
-	for i := range b {
-		b[i] = letters[r.Intn(len(letters))]
-	}
-	return string(b)
-}
-
-// Generate Ascii random stirng with length n
-func GenerateRandomAsciiString(n int) string {
+// GenerateRandomASCIIString generates an ASCII random string with length n.
+func GenerateRandomASCIIString(n int) string {
 	chars := "abcdefghijklmnopqrstuvwxyz" +
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
 		"~!@#$%^&*()-_+={}[]\\|<,>.?/\"';:` "
@@ -32,15 +19,29 @@ func GenerateRandomAsciiString(n int) string {
 	return string(res)
 }
 
-// Truncate a string to maxlen
-func Truncate(s string, maxlen int) string {
-	if len(s) <= maxlen {
+// Ellipsis truncates a string to fit within maxlen, and appends ellipsis (...).
+// For maxlen of 3 and lower, no ellipsis is appended.
+func Ellipsis(s string, maxlen int) string {
+	r := []rune(s)
+	if len(r) <= maxlen {
 		return s
 	}
-	return s[:maxlen]
+	if maxlen <= 3 {
+		return string(r[:maxlen])
+	}
+	return string(r[:maxlen-3]) + "..."
 }
 
-// Test wheather a string is contained in a slice of strings or not.
+// Truncate truncates a string to maxlen.
+func Truncate(s string, maxlen int) string {
+	r := []rune(s)
+	if len(r) <= maxlen {
+		return s
+	}
+	return string(r[:maxlen])
+}
+
+// InSlice tests whether a string is contained in a slice of strings or not.
 // Comparison is case insensitive
 func InSlice(slice []string, s string) bool {
 	for _, ss := range slice {
@@ -63,7 +64,7 @@ func quote(word string, buf *bytes.Buffer) {
 	for i := 0; i < len(word); i++ {
 		b := word[i]
 		if b == '\'' {
-			// Replace literal ' with a close ', a \', and a open '
+			// Replace literal ' with a close ', a \', and an open '
 			buf.WriteString("'\\''")
 		} else {
 			buf.WriteByte(b)
@@ -73,8 +74,8 @@ func quote(word string, buf *bytes.Buffer) {
 	buf.WriteString("'")
 }
 
-// Take a list of strings and escape them so they will be handled right
-// when passed as arguments to an program via a shell
+// ShellQuoteArguments takes a list of strings and escapes them so they will be
+// handled right when passed as arguments to a program via a shell
 func ShellQuoteArguments(args []string) string {
 	var buf bytes.Buffer
 	for i, arg := range args {

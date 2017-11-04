@@ -2,71 +2,50 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"strings"
 
+	"github.com/docker/docker/integration-cli/checker"
 	"github.com/go-check/check"
+	"github.com/gotestyourself/gotestyourself/icmd"
 )
 
 // export an image and try to import it into a new one
 func (s *DockerSuite) TestExportContainerAndImportImage(c *check.C) {
+	testRequires(c, DaemonIsLinux)
 	containerID := "testexportcontainerandimportimage"
 
-	runCmd := exec.Command(dockerBinary, "run", "--name", containerID, "busybox", "true")
-	out, _, err := runCommandWithOutput(runCmd)
-	if err != nil {
-		c.Fatal("failed to create a container", out, err)
-	}
+	dockerCmd(c, "run", "--name", containerID, "busybox", "true")
 
-	exportCmd := exec.Command(dockerBinary, "export", containerID)
-	if out, _, err = runCommandWithOutput(exportCmd); err != nil {
-		c.Fatalf("failed to export container: %s, %v", out, err)
-	}
+	out, _ := dockerCmd(c, "export", containerID)
 
-	importCmd := exec.Command(dockerBinary, "import", "-", "repo/testexp:v1")
-	importCmd.Stdin = strings.NewReader(out)
-	out, _, err = runCommandWithOutput(importCmd)
-	if err != nil {
-		c.Fatalf("failed to import image: %s, %v", out, err)
-	}
+	result := icmd.RunCmd(icmd.Cmd{
+		Command: []string{dockerBinary, "import", "-", "repo/testexp:v1"},
+		Stdin:   strings.NewReader(out),
+	})
+	result.Assert(c, icmd.Success)
 
-	cleanedImageID := strings.TrimSpace(out)
-	if cleanedImageID == "" {
-		c.Fatalf("output should have been an image id, got: %s", out)
-	}
+	cleanedImageID := strings.TrimSpace(result.Combined())
+	c.Assert(cleanedImageID, checker.Not(checker.Equals), "", check.Commentf("output should have been an image id"))
 }
 
 // Used to test output flag in the export command
 func (s *DockerSuite) TestExportContainerWithOutputAndImportImage(c *check.C) {
+	testRequires(c, DaemonIsLinux)
 	containerID := "testexportcontainerwithoutputandimportimage"
 
-	runCmd := exec.Command(dockerBinary, "run", "--name", containerID, "busybox", "true")
-	out, _, err := runCommandWithOutput(runCmd)
-	if err != nil {
-		c.Fatal("failed to create a container", out, err)
-	}
-
+	dockerCmd(c, "run", "--name", containerID, "busybox", "true")
+	dockerCmd(c, "export", "--output=testexp.tar", containerID)
 	defer os.Remove("testexp.tar")
 
-	exportCmd := exec.Command(dockerBinary, "export", "--output=testexp.tar", containerID)
-	if out, _, err = runCommandWithOutput(exportCmd); err != nil {
-		c.Fatalf("failed to export container: %s, %v", out, err)
-	}
+	resultCat := icmd.RunCommand("cat", "testexp.tar")
+	resultCat.Assert(c, icmd.Success)
 
-	out, _, err = runCommandWithOutput(exec.Command("cat", "testexp.tar"))
-	if err != nil {
-		c.Fatal(out, err)
-	}
+	result := icmd.RunCmd(icmd.Cmd{
+		Command: []string{dockerBinary, "import", "-", "repo/testexp:v1"},
+		Stdin:   strings.NewReader(resultCat.Combined()),
+	})
+	result.Assert(c, icmd.Success)
 
-	importCmd := exec.Command(dockerBinary, "import", "-", "repo/testexp:v1")
-	importCmd.Stdin = strings.NewReader(out)
-	out, _, err = runCommandWithOutput(importCmd)
-	if err != nil {
-		c.Fatalf("failed to import image: %s, %v", out, err)
-	}
-
-	cleanedImageID := strings.TrimSpace(out)
-	if cleanedImageID == "" {
-		c.Fatalf("output should have been an image id, got: %s", out)
-	}
+	cleanedImageID := strings.TrimSpace(result.Combined())
+	c.Assert(cleanedImageID, checker.Not(checker.Equals), "", check.Commentf("output should have been an image id"))
 }
